@@ -133,6 +133,92 @@ def cmd_info(args):
         console.print(f"\n[dim]{desc}{suffix}[/dim]")
 
 
+# ---------- 独立 stage 入口（本地文件） ----------
+AUDIO_EXT = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac"}
+VIDEO_EXT = {".mp4", ".mkv", ".flv", ".webm", ".mov", ".avi", ".ts"}
+
+
+def _local_audio_hash(path: Path) -> str:
+    """本地音频/视频文件的缓存 key：(大小, mtime, 头 1KB 内容) 的 hash。"""
+    import hashlib
+    h = hashlib.sha256()
+    st = path.stat()
+    h.update(f"{st.st_size}:{int(st.st_mtime)}:".encode())
+    with path.open("rb") as f:
+        h.update(f.read(1024))
+    return f"local_{path.suffix.lstrip('.')}_{h.hexdigest()[:16]}"
+
+
+def _load_transcript_json(path: Path):
+    """从 .json 转写文件读出 Transcript 对象。"""
+    from .stages.transcribe import Transcript, TranscriptSegment
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return Transcript(
+        language=data["language"],
+        duration=data["duration"],
+        text=data["text"],
+        segments=[TranscriptSegment(**s) for s in data["segments"]],
+    )
+
+
+def cmd_transcribe_file(args):
+    """bili2txt transcribe <file> — 直接转写本地音/视频文件。"""
+    from .stages.transcribe import transcribe as do_transcribe, FasterWhisperTranscriber
+
+    src = Path(args.file).expanduser().resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"文件不存在：{src}")
+
+    # 视频文件 → 先抽音；纯音频 → 直接用
+    if src.suffix.lower() in VIDEO_EXT:
+        wav_dir = src.parent / f".{src.stem}_bili2txt_wav"
+        wav_dir.mkdir(exist_ok=True)
+        wav = wav_dir / "audio.wav"
+        if not wav.exists():
+            console.print(f"[dim]检测到视频格式，先抽音到 {wav} ...[/dim]")
+            import subprocess
+            subprocess.check_call([
+                "ffmpeg", "-y", "-i", str(src),
+                "-vn", "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le",
+                str(wav),
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        audio_path = wav
+    elif src.suffix.lower() in AUDIO_EXT:
+        audio_path = src
+    else:
+        raise ValueError(f"不支持的格式：{src.suffix}（支持音频 {AUDIO_EXT} / 视频 {VIDEO_EXT}）")
+
+    # 临时覆盖 model / language
+    if args.model or args.language:
+        from dataclasses import replace
+        global CONFIG
+        overrides = {}
+        if args.model:
+            overrides["whisper_model"] = args.model
+        if args.language:
+            overrides["whisper_language"] = args.language
+        CONFIG = replace(CONFIG, **overrides)
+
+    # 转写（直接调函数，不走 cache hash 链）
+    console.print(f"[bold cyan]③ 转写[/bold cyan]  [dim]{src.name}  (Whisper {CONFIG.whisper_model})[/dim]")
+    transcriber = FasterWhisperTranscriber(CONFIG)
+    transcript = transcriber.transcribe(audio_path, language=CONFIG.whisper_language)
+
+    # 输出
+    out_txt = Path(args.out) if args.out else src.with_suffix(".transcript.txt")
+    out_json = out_txt.with_suffix(".json")
+    out_txt.write_text(transcript.text, encoding="utf-8")
+    out_json.write_text(json.dumps(transcript.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    console.print(f"  ✓ 语言: {transcript.language}  时长: {transcript.duration:.0f}s  "
+                  f"段数: {len(transcript.segments)}  字数: {len(transcript.text)}")
+    console.print(f"  → {out_txt}")
+    console.print(f"  → {out_json}")
+    if transcript.text:
+        console.print(f"\n[dim]前 300 字预览：[/dim]")
+        console.print(transcript.text[:300] + ("..." if len(transcript.text) > 300 else ""))
+
+
 def cmd_pipeline(args):
     cache = Cache()
     only = args.only
@@ -357,8 +443,15 @@ def build_parser():
   bili2txt BV1xx411c7mD
   bili2txt BV1xx411c7mD --only transcribe
   bili2txt BV1xx411c7mD --skip summarize --whisper-model small
+
+  bili2txt transcribe ./audio.wav
+  bili2txt transcribe ./video.mp4 --model small
+  bili2txt extract ./video.mp4 --out ./audio.wav
+  bili2txt summarize ./transcript.txt --style bullets
+
   bili2txt --info BV1xx411c7mD
   bili2txt --list
+  bili2txt --cleanup --cache --keep-last 3
 """,
     )
     p.add_argument("-V", "--version", action="version", version=f"bili2txt {__version__}")
@@ -389,7 +482,63 @@ def build_parser():
     return p
 
 
+def build_subparser(sub_name: str) -> argparse.ArgumentParser:
+    """给 subcommand 各自一个独立 parser，绕开顶层 url_or_id 冲突。"""
+    p = argparse.ArgumentParser(
+        prog=f"bili2txt {sub_name}",
+        description={
+            "transcribe": "bili2txt transcribe <file> — 音/视频 → 文字（跳过 yt-dlp 下载）",
+            "extract": "bili2txt extract <file> — 视频 → wav（跳过 yt-dlp 下载）",
+            "summarize": "bili2txt summarize <file> — 转写文本 → LLM 总结（跳过 ASR）",
+        }[sub_name],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("file", help="本地文件路径")
+    if sub_name == "transcribe":
+        p.add_argument("--model", help="Whisper 模型（覆盖 WHISPER_MODEL）")
+        p.add_argument("--language", help="强制指定语言，如 zh/en/ja")
+        p.add_argument("--out", help="输出 .txt 路径，默认 ./<file_stem>.transcript.txt")
+    elif sub_name == "extract":
+        p.add_argument("--out", help="输出 wav 路径，默认 ./<file_stem>.wav")
+    elif sub_name == "summarize":
+        p.add_argument("--style", choices=["default", "bullets", "academic", "casual"],
+                       help="总结风格（覆盖 SUMMARY_STYLE）")
+        p.add_argument("--title", help="视频标题（写到总结 markdown 头部）")
+        p.add_argument("--uploader", help="UP 主（写到总结 markdown 头部）")
+        p.add_argument("--out", help="输出 markdown 路径，默认 ./<file_stem>.summary.md")
+    return p
+
+
+SUBCOMMANDS = {"transcribe", "extract", "summarize"}
+
+
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # 手动分发 subcommand（避开 argparse subparsers 跟顶层 url_or_id 的冲突）
+    if argv and argv[0] in SUBCOMMANDS:
+        sub_name = argv[0]
+        sub_args = argv[1:]
+        sub_parser = build_subparser(sub_name)
+        sub_parsed = sub_parser.parse_args(sub_args)
+        try:
+            if sub_name == "transcribe":
+                return cmd_transcribe_file(sub_parsed) or 0
+            elif sub_name == "extract":
+                return cmd_extract_file(sub_parsed) or 0
+            elif sub_name == "summarize":
+                return cmd_summarize_file(sub_parsed) or 0
+        except KeyboardInterrupt:
+            console.print("\n[yellow]已取消[/yellow]")
+            return 130
+        except Exception as e:
+            console.print(f"\n[red]FAIL: [/red] {e}")
+            if "--debug" in argv:
+                raise
+            return 1
+
+    # 主流程
     parser = build_parser()
     args = parser.parse_args(argv)
 
