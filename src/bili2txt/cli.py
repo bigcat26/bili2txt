@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from . import __version__
-from .cache import Cache
+from .cache import Cache, delete_video, list_videos
 from .config import CONFIG
 from .stages.download import (
     VideoMeta,
@@ -213,6 +213,139 @@ def json_load_first(video_dir):
     return None
 
 
+# ---------- cleanup ----------
+def _fmt_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _list_hf_models() -> list[dict]:
+    """列 HF 缓存里的模型。"""
+    out: list[dict] = []
+    try:
+        from huggingface_hub import scan_cache_dir
+        info = scan_cache_dir()
+        for repo in info.repos:
+            if repo.repo_type != "model":
+                continue
+            size = sum(s.size_on_disk for s in repo.revisions[0].files) if repo.revisions else 0
+            out.append({
+                "repo_id": repo.repo_id,
+                "size_bytes": repo.size_on_disk,
+                "revisions": len(repo.revisions),
+                "last_modified": max((r.last_modified for r in repo.revisions), default=None),
+            })
+    except Exception:
+        pass
+    return out
+
+
+def _delete_hf_model(repo_id: str) -> bool:
+    try:
+        from huggingface_hub import scan_cache_dir
+        info = scan_cache_dir()
+        for repo in info.repos:
+            if repo.repo_id == repo_id and repo.repo_type == "model":
+                info.delete_revisions(*[r.commit_id for r in repo.revisions]).execute()
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def cmd_cleanup(args):
+    """清理模型缓存 / 视频产物。默认 dry-run。"""
+    import shutil
+    targets_models = args.cleanup_models or args.cleanup_all
+    targets_cache = args.cleanup_cache or args.cleanup_all
+    if not (targets_models or targets_cache):
+        targets_models = True   # 默认行为：什么都不传时列全部
+        targets_cache = True
+
+    console.print("[bold]🧹 Cleanup 预览（dry-run，加 --force 才真删）[/bold]\n")
+
+    # ---- 模型 ----
+    if targets_models:
+        models = _list_hf_models()
+        # 也看 modelscope 的缓存
+        ms_root = Path.home() / ".cache" / "modelscope" / "hub"
+        ms_models: list[dict] = []
+        if ms_root.exists():
+            for d in ms_root.iterdir():
+                if d.is_dir():
+                    size = sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+                    ms_models.append({"path": d, "size": size, "name": d.name})
+
+        if not models and not ms_models:
+            console.print("[dim]HF / modelscope 缓存里没有模型[/dim]")
+        else:
+            console.print(f"[bold cyan]模型缓存[/bold cyan]")
+            for m in sorted(models, key=lambda x: -x["size_bytes"]):
+                last = m["last_modified"].strftime("%Y-%m-%d %H:%M") if m["last_modified"] else "?"
+                console.print(f"  [green]HF[/green] {m['repo_id']:<48} {_fmt_size(m['size_bytes']):>10}  {last}")
+            for m in sorted(ms_models, key=lambda x: -x["size"]):
+                console.print(f"  [magenta]MS[/magenta] {m['name']:<48} {_fmt_size(m['size']):>10}")
+            total = sum(m["size_bytes"] for m in models) + sum(m["size"] for m in ms_models)
+            console.print(f"  [dim]合计: {_fmt_size(total)}[/dim]\n")
+
+    # ---- 视频缓存 ----
+    if targets_cache:
+        videos = list_videos()
+        if not videos:
+            console.print("[dim]没有已处理的视频[/dim]")
+        else:
+            # 按 mtime 排序，最新在前
+            videos.sort(key=lambda v: -v["mtime"])
+            keep_n = args.keep_last or 0
+            console.print(f"[bold cyan]视频产物 ({len(videos)} 个)[/bold cyan]" +
+                          (f"  [dim]--keep-last {keep_n}，保留最新 {min(keep_n, len(videos))} 个[/dim]"
+                           if keep_n else ""))
+            for i, v in enumerate(videos):
+                # keep_n > 0 且 i < keep_n 则保留
+                mark = "[green]KEEP[/green]" if (keep_n and i < keep_n) else "[yellow]DROP[/yellow]"
+                import datetime
+                ts = datetime.datetime.fromtimestamp(v["mtime"]).strftime("%Y-%m-%d %H:%M")
+                console.print(f"  {mark}  {v['hash']:<22} {_fmt_size(v['size_bytes']):>10}  "
+                              f"{ts}  {v['title'][:40]}")
+            if not args.force:
+                console.print(f"\n[dim]确认删除加 --force[/dim]")
+            console.print()
+
+    if not args.force:
+        return
+
+    # ---- 真删 ----
+    if args.force:
+        deleted = []
+        if targets_models:
+            for m in models if targets_models else []:
+                if _delete_hf_model(m["repo_id"]):
+                    deleted.append(f"HF:{m['repo_id']}")
+            for m in ms_models:
+                try:
+                    shutil.rmtree(m["path"])
+                    deleted.append(f"MS:{m['name']}")
+                except Exception:
+                    pass
+        if targets_cache:
+            keep_n = args.keep_last or 0
+            for i, v in enumerate(videos):
+                if keep_n and i < keep_n:
+                    continue
+                if delete_video(v["hash"]):
+                    deleted.append(f"cache:{v['hash']}")
+
+        if deleted:
+            console.print(f"[green]✓ 已删：[/green]")
+            for d in deleted:
+                console.print(f"  - {d}")
+        else:
+            console.print("[dim]没删任何东西[/dim]")
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="bili2txt",
@@ -242,6 +375,17 @@ def build_parser():
                    help="只看视频元信息，不下载（例: --info BV1xx...）")
     p.add_argument("--list", dest="list_cache", action="store_true",
                    help="列出已处理的视频")
+    # cleanup 标志
+    p.add_argument("--cleanup", dest="do_cleanup", action="store_true",
+                   help="清理模型缓存 / 视频产物（默认 dry-run，加 --force 真删）")
+    p.add_argument("--models", dest="cleanup_models", action="store_true",
+                   help="配合 --cleanup：只清模型")
+    p.add_argument("--cache", dest="cleanup_cache", action="store_true",
+                   help="配合 --cleanup：只清视频产物")
+    p.add_argument("--all", dest="cleanup_all", action="store_true",
+                   help="配合 --cleanup：模型+视频产物全清")
+    p.add_argument("--keep-last", type=int, default=0, metavar="N",
+                   help="配合 --cleanup --cache：保留最近 N 个视频产物")
     return p
 
 
@@ -254,6 +398,8 @@ def main(argv=None):
     if args.info_target:
         args.url_or_id = args.info_target
         return cmd_info(args) or 0
+    if args.do_cleanup:
+        return cmd_cleanup(args) or 0
 
     if not args.url_or_id:
         parser.print_help()

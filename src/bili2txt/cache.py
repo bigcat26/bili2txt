@@ -85,3 +85,55 @@ def hash_file(path: Path, chunk: int = 1 << 20) -> str:
                 break
             h.update(block)
     return h.hexdigest()[:16]
+
+
+# ---------- cleanup ----------
+def list_videos(root: Path | None = None) -> list[dict]:
+    """列出 cache 下所有视频产物，返回 [{hash, title, size_bytes, mtime, stages: [...]}, ...]。"""
+    root = root or CONFIG.cache_dir
+    if not root.exists():
+        return []
+    out: list[dict] = []
+    for d in sorted(root.iterdir()):
+        if not d.is_dir():
+            continue
+        # 读 download stage 的 meta（最权威的标题）
+        title = d.name
+        size_bytes = 0
+        mtime = d.stat().st_mtime
+        stages: list[str] = []
+        for stage_dir in sorted(d.iterdir()):
+            if not stage_dir.is_dir():
+                continue
+            stages.append(stage_dir.name)
+            for p in stage_dir.rglob("*"):
+                if p.is_file():
+                    size_bytes += p.stat().st_size
+            mp = stage_dir / "meta.json"
+            if mp.exists():
+                try:
+                    import json
+                    extra = json.loads(mp.read_text(encoding="utf-8")).get("extra", {})
+                    if "title" in extra and extra["title"]:
+                        title = extra["title"]
+                except Exception:
+                    pass
+        out.append({
+            "hash": d.name,
+            "title": title,
+            "size_bytes": size_bytes,
+            "mtime": mtime,
+            "stages": stages,
+        })
+    return out
+
+
+def delete_video(video_hash: str, root: Path | None = None) -> bool:
+    """删某个视频的所有 stage。返回是否真删了。"""
+    import shutil
+    root = root or CONFIG.cache_dir
+    d = root / video_hash
+    if d.exists() and d.is_dir():
+        shutil.rmtree(d)
+        return True
+    return False

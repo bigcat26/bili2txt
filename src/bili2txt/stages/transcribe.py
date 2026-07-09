@@ -16,33 +16,75 @@ from ..cache import Cache
 from ..config import Config
 
 
-def ensure_model(model_name: str, local_dir: Path | None = None) -> str:
-    """确保模型在本地可用。返回模型路径（本地目录）。
+def resolve_repo_id(model_name: str) -> str:
+    """把用户写的短名 / 长名统一成 HF repo_id。
 
-    - 如果 model_name 已经是本地路径，直接返回
-    - 否则尝试 modelscope 下载（国内可用），失败时回退到 huggingface_hub
+    接受:
+      - "base"                         → "Systran/faster-whisper-base"
+      - "faster-whisper-base"          → "Systran/faster-whisper-base"
+      - "Systran/faster-whisper-base"  → "Systran/faster-whisper-base"
+      - "guillaumekln/faster-whisper"  → 原样返回
     """
+    if "/" in model_name:
+        # 已经是 owner/name 形式
+        if model_name.startswith("faster-whisper-"):
+            return f"Systran/{model_name}"
+        return model_name
+    if not model_name.startswith("faster-whisper-"):
+        return f"Systran/faster-whisper-{model_name}"
+    return f"Systran/{model_name}"
+
+
+def ensure_model(model_name: str) -> str:
+    """确保模型在本地可用。返回模型快照目录路径。
+
+    优先级：本地路径 > huggingface_hub (HF_ENDPOINT 默认 hf-mirror.com 国内加速)
+             > modelscope 兜底（镜像文件 hash 可能跟 HF 不完全一致，加载可能报校验错）
+
+    模型缓存路径：~/.cache/huggingface/hub/models--{owner}--{name}/snapshots/<rev>/
+    （huggingface_hub 默认路径，跟 `huggingface-cli` 兼容，方便 cleanup）
+    """
+    # 1) 本地路径直传
     p = Path(model_name).expanduser()
     if p.exists() and (p / "config.json").exists():
         return str(p)
 
-    target = local_dir or (Path.home() / ".cache" / "bili2txt" / "models" / model_name)
-    target = Path(target)
-    if (target / "config.json").exists():
-        return str(target)
+    repo_id = resolve_repo_id(model_name)
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    # 2) 检查 HF 缓存是否已经下过
     try:
-        from modelscope import snapshot_download
-        downloaded = snapshot_download(f"Systran/{model_name}", cache_dir=str(target.parent))
-        # modelscope 返回的是 snapshots/master 路径，里面有 config.json
-        return downloaded
-    except Exception as e:
-        # 回退到 huggingface_hub（需要能访问 huggingface.co / HF_ENDPOINT）
+        from huggingface_hub import scan_cache_dir
+        info = scan_cache_dir()
+        for repo in info.repos:
+            if repo.repo_id == repo_id and repo.repo_type == "model":
+                # 找最新 revision 的 snapshot
+                revisions = sorted(repo.revisions, key=lambda r: r.last_modified, reverse=True)
+                if revisions:
+                    snap_path = str(revisions[0].snapshot_path)
+                    if Path(snap_path, "config.json").exists():
+                        return snap_path
+    except Exception:
+        pass
+
+    # 3) 走 HF 下载
+    hf_endpoint = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
+    os.environ["HF_ENDPOINT"] = hf_endpoint
+    # 国内 hf-mirror.com 上 xet 链路不稳，关掉走普通 HTTP
+    os.environ.setdefault("USE_HF_XET", "0")
+    try:
         from huggingface_hub import snapshot_download as hf_snapshot
-        if "HF_ENDPOINT" not in os.environ:
-            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-        return hf_snapshot(repo_id=f"Systran/{model_name}", cache_dir=str(target.parent))
+        return hf_snapshot(repo_id=repo_id, cache_dir=None)  # None = 用 HF 默认缓存
+    except Exception as e:
+        # 4) HF 不通时，modelscope 兜底（仅建议在 tiny/base/small 用，large 系列可能 hash 不一致）
+        try:
+            from modelscope import snapshot_download as ms_snapshot
+            return ms_snapshot(repo_id=repo_id)
+        except Exception:
+            raise RuntimeError(
+                f"无法下载模型 {repo_id}（HF endpoint={hf_endpoint} 不通，modelscope 也失败）。\n"
+                f"原始错误: {e}\n"
+                f"试试手动下载后用本地路径：WHISPER_MODEL=/path/to/model"
+            ) from e
 
 
 @dataclass

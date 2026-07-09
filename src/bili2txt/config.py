@@ -41,6 +41,17 @@ class Config:
     @classmethod
     def load(cls) -> "Config":
         load_dotenv(ENV_FILE)
+        # python-dotenv 默认 strip 等号后空格，导致 inline 注释 "  # 注释" 变成 "# 注释"
+        # 手动剥掉 value 里 # 之后的内容（保留引号包裹的 #）
+        for key in ("WHISPER_LANGUAGE", "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL",
+                    "SUMMARY_STYLE", "WHISPER_MODEL", "YTDLP_COOKIES"):
+            v = os.getenv(key, "")
+            if v and "#" in v:
+                # 如果 value 被引号包着，不动
+                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                    continue
+                cleaned = v.split("#", 1)[0].rstrip()
+                os.environ[key] = cleaned
 
         data_dir = PROJECT_ROOT / "data"
         cookies_raw = os.getenv("YTDLP_COOKIES", "").strip()

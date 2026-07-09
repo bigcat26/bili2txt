@@ -55,6 +55,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "faster-whisper" },
+    { name = "hf-xet" },
     { name = "modelscope" },
     { name = "openai" },
     { name = "python-dotenv" },
@@ -65,6 +66,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "faster-whisper", specifier = ">=1.2.1" },
+    { name = "hf-xet", specifier = ">=1.5.1" },
     { name = "modelscope", specifier = ">=1.38.1" },
     { name = "openai", specifier = ">=2.44.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
