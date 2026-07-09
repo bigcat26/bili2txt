@@ -1,0 +1,281 @@
+"""CLI 入口：bili2txt <BV/URL> [options]"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from pathlib import Path
+
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
+from . import __version__
+from .cache import Cache
+from .config import CONFIG
+from .stages.download import (
+    VideoMeta,
+    download_video,
+    extract_video_id,
+    fetch_video_info,
+    normalize_url,
+)
+from .stages.extract import extract_audio
+from .stages.summarize import summarize
+from .stages.transcribe import transcribe
+
+console = Console()
+
+
+def video_hash_key(video_id: str) -> str:
+    return f"bv_{video_id}"
+
+
+def _stage_download(cache, normalized_url, vhash, force):
+    if not cache.has(vhash, "download") or force:
+        console.print(f"\n[bold cyan]① 下载视频[/bold cyan]  [dim]({vhash})[/dim]")
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                      TimeElapsedColumn(), console=console, transient=True) as p:
+            p.add_task("yt-dlp 下载中...", total=None)
+            video_path, meta = download_video(normalized_url, vhash, cache, CONFIG.ytdlp_cookies)
+        console.print(f"  OK {meta.title}")
+        size_mb = video_path.stat().st_size // 1024 // 1024
+        console.print(f"  OK {video_path.relative_to(CONFIG.project_root)}  ({size_mb} MB)")
+    else:
+        out = cache.get_output(vhash, "download")
+        console.print(f"[green]① 下载视频 命中缓存[/green]  {out.relative_to(CONFIG.project_root)}")
+        mp = cache.meta_path(vhash, "download")
+        extra = json.loads(mp.read_text(encoding="utf-8")).get("extra", {})
+        meta = VideoMeta(
+            video_id=extra["video_id"],
+            title=extra["title"],
+            duration=extra["duration"],
+            uploader=extra["uploader"],
+            webpage_url=extra["webpage_url"],
+        )
+        video_path = out
+    return video_path, meta
+
+
+def _stage_extract(cache, video_path, vhash, force):
+    if not cache.has(vhash, "extract") or force:
+        console.print(f"\n[bold cyan]② 抽音频 wav[/bold cyan]")
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                      TimeElapsedColumn(), console=console, transient=True) as p:
+            p.add_task("ffmpeg 抽音中...", total=None)
+            wav = extract_audio(video_path, vhash, cache)
+        size_mb = wav.stat().st_size // 1024 // 1024
+        console.print(f"  OK {wav.relative_to(CONFIG.project_root)}  ({size_mb} MB)")
+    else:
+        wav = cache.get_output(vhash, "extract")
+        console.print(f"[green]② 抽音频 命中缓存[/green]  {wav.relative_to(CONFIG.project_root)}")
+    return wav
+
+
+def _stage_transcribe(cache, wav, vhash, force):
+    if not cache.has(vhash, "transcribe") or force:
+        console.print(f"\n[bold cyan]③ 转写 (Whisper {CONFIG.whisper_model})[/bold cyan]")
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                      TimeElapsedColumn(), console=console, transient=True) as p:
+            p.add_task("语音转文字中（首次会下载模型）...", total=None)
+            transcript = transcribe(wav, vhash, cache, CONFIG)
+        console.print(f"  OK 语言: {transcript.language}  时长: {transcript.duration:.0f}s  "
+                      f"段数: {len(transcript.segments)}  字数: {len(transcript.text)}")
+        console.print(f"\n[dim]前 300 字预览：[/dim]")
+        preview = transcript.text[:300] + ("..." if len(transcript.text) > 300 else "")
+        console.print(preview)
+    else:
+        transcript = transcribe(wav, vhash, cache, CONFIG)
+        preview = transcript.text[:300] + ("..." if len(transcript.text) > 300 else "")
+        console.print(f"[green]③ 转写 命中缓存[/green]  {preview}")
+    return transcript
+
+
+def _stage_summarize(cache, transcript, meta, vhash):
+    if not CONFIG.llm_api_key:
+        console.print("\n[yellow]④ 跳过 LLM 总结：未配置 LLM_API_KEY[/yellow]")
+        console.print("[dim]复制 .env.example 为 .env 并填 LLM_API_KEY，再去掉 --skip summarize 即可调用。[/dim]")
+        return None
+
+    if cache.has(vhash, "summarize"):
+        cached_md = cache.get_output(vhash, "summarize")
+        console.print(f"[green]④ LLM 总结 命中缓存[/green]  {cached_md.relative_to(CONFIG.project_root)}")
+        return cached_md.read_text(encoding="utf-8")
+
+    console.print(f"\n[bold cyan]④ LLM 总结[/bold cyan]  [dim]({CONFIG.llm_model})[/dim]")
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  TimeElapsedColumn(), console=console, transient=True) as p:
+        p.add_task("LLM 生成总结中...", total=None)
+        summary = summarize(transcript, meta, vhash, cache, CONFIG)
+
+    console.print(f"\n[bold green]OK 总结完成[/bold green]")
+    out_path = CONFIG.output_dir / f"{meta.video_id}_{meta.display_title}.md"
+    console.print(f"  -> {out_path.relative_to(CONFIG.project_root)}")
+    console.print(f"\n[dim]--- 总结预览 ---[/dim]")
+    preview = summary[:600] + ("..." if len(summary) > 600 else "")
+    console.print(preview)
+    return summary
+
+
+def cmd_info(args):
+    target = normalize_url(args.url_or_id)
+    console.print(f"[dim]Fetching info for {target} ...[/dim]")
+    meta, _raw = fetch_video_info(target, CONFIG.ytdlp_cookies)
+    console.print(f"\n[bold]{meta.title}[/bold]\n")
+    console.print(f"  ID:       {meta.video_id}")
+    console.print(f"  UP:       {meta.uploader}")
+    console.print(f"  Duration: {meta.duration // 60}m{meta.duration % 60}s ({meta.duration}s)")
+    console.print(f"  URL:      {meta.webpage_url}")
+    if meta.description and meta.description != "-":
+        desc = meta.description[:500]
+        suffix = "..." if len(meta.description) > 500 else ""
+        console.print(f"\n[dim]{desc}{suffix}[/dim]")
+
+
+def cmd_pipeline(args):
+    cache = Cache()
+    only = args.only
+    skip = set(args.skip or [])
+    force = args.force
+
+    normalized_url = normalize_url(args.url_or_id)
+    try:
+        video_id = extract_video_id(normalized_url)
+    except ValueError:
+        console.print("[dim]URL 中没识别到 BV 号，先抓元数据...[/dim]")
+        meta, _ = fetch_video_info(normalized_url, CONFIG.ytdlp_cookies)
+        video_id = meta.video_id
+
+    vhash = video_hash_key(video_id)
+
+    if force:
+        d = cache.video_dir(vhash)
+        if d.exists():
+            shutil.rmtree(d)
+            console.print(f"[yellow]已清空缓存：{d}[/yellow]")
+
+    video_path, meta = _stage_download(cache, normalized_url, vhash, force)
+    if only == "download":
+        return
+
+    wav = _stage_extract(cache, video_path, vhash, force)
+    if only == "extract":
+        return
+
+    transcript = _stage_transcribe(cache, wav, vhash, force)
+    if only == "transcribe":
+        return
+
+    if "summarize" in skip:
+        console.print("\n[yellow]④ 已跳过总结 (--skip summarize)[/yellow]")
+        return
+
+    _stage_summarize(cache, transcript, meta, vhash)
+
+
+def cmd_list(args):
+    cache = Cache()
+    if not cache.root.exists():
+        console.print("[yellow]还没有任何缓存[/yellow]")
+        return
+    dirs = sorted([d for d in cache.root.iterdir() if d.is_dir()])
+    if not dirs:
+        console.print("[yellow]还没有任何缓存[/yellow]")
+        return
+    console.print(f"\n[bold]已处理视频 ({len(dirs)} 个)[/bold]\n")
+    for d in dirs:
+        first_meta = json_load_first(d)
+        if first_meta:
+            console.print(f"[bold cyan]{first_meta.get('extra', {}).get('title', d.name)}[/bold cyan]")
+            console.print(f"  {d.name}  -> {d.relative_to(CONFIG.project_root)}")
+            for m in sorted(d.glob("*/meta.json")):
+                stage = m.parent.name
+                extra_size = ""
+                if stage == "download":
+                    sz = first_meta.get("extra", {}).get("size_bytes", 0)
+                    extra_size = f"  ({sz // 1024 // 1024} MB)"
+                elif stage == "transcribe":
+                    cnt = first_meta.get("extra", {}).get("segment_count", "")
+                    extra_size = f"  ({cnt} segments)" if cnt else ""
+                console.print(f"  + [green]OK[/green] {stage}{extra_size}")
+            console.print()
+
+
+def json_load_first(video_dir):
+    for stage in ("download", "extract", "transcribe", "summarize"):
+        mp = video_dir / stage / "meta.json"
+        if mp.exists():
+            try:
+                return json.loads(mp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+    return None
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="bili2txt",
+        description="B 站视频 → 音频 → 文字 → LLM 总结",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+示例:
+  bili2txt https://www.bilibili.com/video/BV1xx411c7mD
+  bili2txt BV1xx411c7mD
+  bili2txt BV1xx411c7mD --only transcribe
+  bili2txt BV1xx411c7mD --skip summarize --whisper-model small
+  bili2txt --info BV1xx411c7mD
+  bili2txt --list
+""",
+    )
+    p.add_argument("-V", "--version", action="version", version=f"bili2txt {__version__}")
+    p.add_argument("url_or_id", nargs="?", help="BV 号 / av 号 / B 站完整 URL")
+    p.add_argument("--only",
+                   choices=["download", "extract", "transcribe"],
+                   help="只跑到指定阶段就停（不调用 LLM）")
+    p.add_argument("--skip", nargs="*", choices=["summarize"], default=[],
+                   help="跳过某些阶段（目前仅支持 summarize）")
+    p.add_argument("--force", action="store_true",
+                   help="忽略缓存，强制重跑所有阶段")
+    p.add_argument("--whisper-model", help="覆盖 WHISPER_MODEL 环境变量")
+    p.add_argument("--info", dest="info_target", metavar="URL",
+                   help="只看视频元信息，不下载（例: --info BV1xx...）")
+    p.add_argument("--list", dest="list_cache", action="store_true",
+                   help="列出已处理的视频")
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.list_cache:
+        return cmd_list(args) or 0
+    if args.info_target:
+        args.url_or_id = args.info_target
+        return cmd_info(args) or 0
+
+    if not args.url_or_id:
+        parser.print_help()
+        return 1
+
+    if args.whisper_model:
+        from dataclasses import replace
+        global CONFIG
+        CONFIG = replace(CONFIG, whisper_model=args.whisper_model)
+
+    try:
+        cmd_pipeline(args)
+        return 0
+    except KeyboardInterrupt:
+        console.print("\n[yellow]已取消[/yellow]")
+        return 130
+    except Exception as e:
+        console.print(f"\n[red]FAIL: [/red] {e}")
+        if "--debug" in sys.argv:
+            raise
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Data & cache (本地产物，不入库)
+data/cache/
+data/output/
+models/
+
+# 打包产物（开发期临时打 zip 分享用）
+*.zip
+
+# Environment
+.env
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
