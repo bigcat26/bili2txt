@@ -280,6 +280,195 @@ def cmd_summarize_file(args):
         console.print(summary[:600] + ("..." if len(summary) > 600 else ""))
 
 
+
+def _read_batch_lines(path: str) -> tuple[list[str], str, int, int]:
+    """读批量输入：每行一条，空行 / `#` 开头注释 / 行内注释 全部跳过，保留去重后顺序。
+
+    返回: (valid_lines, src_label, skipped_count, total_raw_lines)
+    """
+    from .stages.download import _BV_RE, _AV_RE
+
+    def _is_valid(line: str) -> bool:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            return False
+        if s.startswith("http://") or s.startswith("https://"):
+            return True
+        return bool(_BV_RE.fullmatch(s) or _AV_RE.fullmatch(s))
+
+    if path == "-":
+        raw = sys.stdin.read().splitlines()
+        src_label = "<stdin>"
+    else:
+        p = Path(path).expanduser()
+        if not p.exists():
+            raise FileNotFoundError(f"批量输入文件不存在：{p}")
+        raw = p.read_text(encoding="utf-8").splitlines()
+        src_label = str(p)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    skipped = 0
+    for line in raw:
+        # 行内注释：仅当 # 前有空白时才视作注释，避免误伤 URL fragment
+        stripped = line.strip()
+        hash_pos = stripped.find("  #")
+        if hash_pos != -1:
+            stripped = stripped[:hash_pos].rstrip()
+        if not _is_valid(stripped):
+            skipped += 1
+            continue
+        if stripped in seen:
+            skipped += 1
+            continue
+        seen.add(stripped)
+        out.append(stripped)
+    return out, src_label, skipped, len(raw)
+
+
+def _short_err(err: str, limit: int = 200) -> str:
+    """把常见的 noisy 异常信息压缩成一行。专门处理 CalledProcessError
+    （yt-dlp 失败时它会把整条命令 + 路径贴进 str(e)，非常长）。"""
+    import re
+    if err.startswith("CalledProcessError:"):
+        # 抽出"returned non-zero exit status N"
+        m = re.search(r"returned non-zero exit status (\d+)", err)
+        status = m.group(1) if m else "?"
+        # subprocess.check_call 的 str(e) 只含命令列表 + exit code；
+        # 真实 yt-dlp stderr 没被捕获，所以这里给一个简短回执，详细原因看终端日志
+        return f"yt-dlp 失败 (exit={status})，看上方 yt-dlp 输出"
+    s = err.strip().replace("\n", " ")
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _run_one(url_or_id: str, batch_args) -> tuple[bool, str, float]:
+    """调一次 cmd_pipeline，返回 (ok, err_msg, elapsed_s)。"""
+    import time
+    t0 = time.monotonic()
+    ns = argparse.Namespace(
+        url_or_id=url_or_id,
+        only=batch_args.only,
+        skip=list(batch_args.skip or []),
+        force=batch_args.force,
+        style=getattr(batch_args, "style", None),
+        quality=getattr(batch_args, "quality", None),
+        template=getattr(batch_args, "template", None),
+    )
+    # 应用一次性全局覆盖（不影响下次迭代的 batch_args）
+    from dataclasses import replace as _r
+    global CONFIG
+    saved_cfg = CONFIG
+    if getattr(batch_args, "whisper_model", None):
+        CONFIG = _r(CONFIG, whisper_model=batch_args.whisper_model)
+    if getattr(batch_args, "language", None):
+        CONFIG = _r(CONFIG, whisper_language=batch_args.language)
+    try:
+        cmd_pipeline(ns)
+        return True, "", time.monotonic() - t0
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}", time.monotonic() - t0
+    finally:
+        CONFIG = saved_cfg
+
+
+def cmd_batch(args):
+    """bili2txt batch <file> — 批量跑 N 个视频，单条失败不影响后续。"""
+    items, src_label, skipped, total_raw = _read_batch_lines(args.file)
+    if not items:
+        console.print(f"[yellow]批量输入里没有有效条目[/yellow]  来源: {src_label}  原始 {total_raw} 行")
+        return 1
+
+    console.print(f"\n[bold]📦 批量任务[/bold]  来源: [cyan]{src_label}[/cyan]")
+    console.print(f"  有效: [green]{len(items)}[/green]  跳过(空/注释/重复/非法): {skipped}  原始: {total_raw} 行")
+    console.print(f"  策略: {args.only or '全流程'}  "
+                  f"skip={list(args.skip or []) or '[]'}  "
+                  f"force={args.force}  jobs={args.jobs}  "
+                  f"stop_on_error={args.stop_on_error}")
+    console.print()
+
+    results: list[dict] = []
+    if args.jobs <= 1:
+        for i, url in enumerate(items, 1):
+            console.rule(f"[{i}/{len(items)}] {url}")
+            ok, err, elapsed = _run_one(url, args)
+            results.append({"i": i, "url": url, "ok": ok, "err": err, "elapsed": elapsed})
+            mark = "[green]✓[/green]" if ok else "[red]✗[/red]"
+            tail = f"  [red]{_short_err(err)}[/red]" if not ok else ""
+            console.print(f"\n{mark} [{i}/{len(items)}] {url}  [dim]({elapsed:.1f}s)[/dim]{tail}\n")
+            if not ok and args.stop_on_error:
+                console.print("[yellow]--stop-on-error：中止后续任务[/yellow]")
+                break
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+            future_to_url = {ex.submit(_run_one, url, args): (i, url)
+                             for i, url in enumerate(items, 1)}
+            for fut in as_completed(future_to_url):
+                i, url = future_to_url[fut]
+                try:
+                    ok, err, elapsed = fut.result()
+                except Exception as e:
+                    ok, err, elapsed = False, f"{type(e).__name__}: {e}", 0.0
+                results.append({"i": i, "url": url, "ok": ok, "err": err, "elapsed": elapsed})
+                mark = "[green]✓[/green]" if ok else "[red]✗[/red]"
+                tail = f"  [red]{_short_err(err)}[/red]" if not ok else ""
+                console.print(f"{mark} [{i}/{len(items)}] {url}  [dim]({elapsed:.1f}s)[/dim]{tail}")
+                if not ok and args.stop_on_error:
+                    console.print("[yellow]--stop-on-error：中止后续任务[/yellow]")
+                    for f2 in future_to_url:
+                        f2.cancel()
+                    break
+        results.sort(key=lambda r: r["i"])
+
+    # 汇总
+    success = sum(1 for r in results if r["ok"])
+    failed = len(results) - success
+    total_s = sum(r["elapsed"] for r in results)
+    console.rule("[bold]📊 批量汇总[/bold]")
+    console.print(f"  总数: {len(items)}  成功: [green]{success}[/green]  失败: [red]{failed}[/red]  "
+                  f"用时: {total_s:.1f}s")
+    if failed:
+        console.print("\n[red]失败明细：[/red]")
+        for r in results:
+            if not r["ok"]:
+                console.print(f"  - [{r['i']}/{len(items)}] {r['url']}")
+                console.print(f"      {_short_err(r['err'])}")
+
+    # 报告
+    if not args.no_report:
+        from datetime import datetime
+        if args.report:
+            report_path = Path(args.report).expanduser()
+        else:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_path = CONFIG.project_root / f"bili2txt_batch_report_{stamp}.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            f"# bili2txt 批量任务报告",
+            f"",
+            f"- **时间**: {datetime.now().isoformat(timespec='seconds')}",
+            f"- **来源**: {src_label}",
+            f"- **总数**: {len(items)}    **成功**: {success}    **失败**: {failed}",
+            f"- **用时**: {total_s:.1f}s    **策略**: {args.only or '全流程'} "
+            f"skip={list(args.skip or []) or '[]'} force={args.force} jobs={args.jobs}",
+            f"",
+            f"## 明细",
+            f"",
+            f"| # | 状态 | 链接 | 用时 | 说明 |",
+            f"|---|------|------|------|------|",
+        ]
+        for r in results:
+            mark = "✅" if r["ok"] else "❌"
+            note = "" if r["ok"] else _short_err(r["err"]).replace("|", "\\|")
+            lines.append(f"| {r['i']} | {mark} | {r['url']} | {r['elapsed']:.1f}s | {note} |")
+        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        console.print(f"\n  📝 报告: [cyan]{report_path.relative_to(CONFIG.project_root)}[/cyan]")
+
+    return 0 if failed == 0 else 1
+
+
 def cmd_pipeline(args):
     cache = Cache()
     only = args.only
@@ -522,6 +711,10 @@ def build_parser():
   bili2txt --info BV1xx411c7mD
   bili2txt --list
   bili2txt --cleanup --cache --keep-last 3
+
+  bili2txt batch ./videos.txt
+  bili2txt batch ./videos.txt --only transcribe --stop-on-error
+  cat videos.txt | bili2txt batch -
 """,
     )
     p.add_argument("-V", "--version", action="version", version=f"bili2txt {__version__}")
@@ -565,6 +758,7 @@ def build_subparser(sub_name: str) -> argparse.ArgumentParser:
             "transcribe": "bili2txt transcribe <file> — 音/视频 → 文字（跳过 yt-dlp 下载）",
             "extract": "bili2txt extract <file> — 视频 → wav（跳过 yt-dlp 下载）",
             "summarize": "bili2txt summarize <file> — 转写文本 → LLM 总结（跳过 ASR）",
+            "batch": "bili2txt batch <file> — 批量跑 N 个视频（每行一个 BV / URL）",
         }[sub_name],
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -582,10 +776,31 @@ def build_subparser(sub_name: str) -> argparse.ArgumentParser:
         p.add_argument("--title", help="视频标题（写到总结 markdown 头部）")
         p.add_argument("--uploader", help="UP 主（写到总结 markdown 头部）")
         p.add_argument("--out", help="输出 markdown 路径，默认 ./<file_stem>.summary.md")
+    elif sub_name == "batch":
+        # 主流程开关（跟顶层保持一致）
+        p.add_argument("--only", choices=["download", "extract", "transcribe", "summarize"],
+                       help="只跑到指定阶段")
+        p.add_argument("--skip", action="append", choices=["download", "extract", "transcribe", "summarize"],
+                       help="跳过指定阶段（可重复）")
+        p.add_argument("--force", action="store_true", help="清掉每个视频的缓存后重跑")
+        p.add_argument("--quality", choices=["audio", "360", "480", "720", "1080", "best"],
+                       help="下载清晰度（默认 audio 仅音频）")
+        p.add_argument("--style", choices=STYLES, help="总结风格（覆盖 SUMMARY_STYLE）")
+        p.add_argument("--template", help="自定义 jinja2 总结模板路径")
+        p.add_argument("--whisper-model", help="覆盖 WHISPER_MODEL")
+        p.add_argument("--language", help="强制指定语言，如 zh/en/ja")
+        # 批量行为
+        p.add_argument("--jobs", "-j", type=int, default=1,
+                       help="并发数（默认 1 串行；Whisper 抢 CPU，建议保持 1）")
+        p.add_argument("--stop-on-error", action="store_true",
+                       help="遇到失败立即停止后续（默认继续）")
+        p.add_argument("--report", metavar="PATH",
+                       help="把汇总报告写到指定文件（默认 ./bili2txt_batch_report_<时间>.md）")
+        p.add_argument("--no-report", action="store_true", help="不写汇总报告")
     return p
 
 
-SUBCOMMANDS = {"transcribe", "extract", "summarize"}
+SUBCOMMANDS = {"transcribe", "extract", "summarize", "batch"}
 
 
 def main(argv=None):
@@ -605,6 +820,8 @@ def main(argv=None):
                 return cmd_extract_file(sub_parsed) or 0
             elif sub_name == "summarize":
                 return cmd_summarize_file(sub_parsed) or 0
+            elif sub_name == "batch":
+                return cmd_batch(sub_parsed) or 0
         except KeyboardInterrupt:
             console.print("\n[yellow]已取消[/yellow]")
             return 130
