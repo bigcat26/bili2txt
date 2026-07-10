@@ -4,6 +4,7 @@ import pytest
 
 from bili2txt.stages.download import (
     VideoMeta,
+    build_format,
     extract_video_id,
     normalize_url,
 )
@@ -32,6 +33,17 @@ def test_extract_video_id_invalid():
 ])
 def test_normalize_url(inp, expected):
     assert normalize_url(inp) == expected
+
+
+@pytest.mark.parametrize("quality,expected", [
+    ("audio", "ba/bestaudio"),
+    ("best", "bv*+ba/b"),
+    ("360", "bv[height<=360]+ba/b"),
+    ("1080", "bv[height<=1080]+ba/b"),
+    ("weird", "bv*+ba/b"),
+])
+def test_build_format(quality, expected):
+    assert build_format(quality) == expected
 
 
 def test_video_meta_display_title_sanitized():

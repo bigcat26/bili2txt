@@ -40,7 +40,8 @@ def _stage_download(cache, normalized_url, vhash, force):
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                       TimeElapsedColumn(), console=console, transient=True) as p:
             p.add_task("yt-dlp 下载中...", total=None)
-            video_path, meta = download_video(normalized_url, vhash, cache, CONFIG.ytdlp_cookies)
+            video_path, meta = download_video(
+                normalized_url, vhash, cache, CONFIG.ytdlp_cookies, CONFIG.download_quality)
         console.print(f"  OK {meta.title}")
         size_mb = video_path.stat().st_size // 1024 // 1024
         console.print(f"  OK {video_path.relative_to(CONFIG.project_root)}  ({size_mb} MB)")
@@ -285,10 +286,12 @@ def cmd_pipeline(args):
     skip = set(args.skip or [])
     force = args.force
 
-    # --style 覆盖默认总结风格
+    # --style 覆盖默认总结风格；--quality 覆盖默认下载清晰度
     global CONFIG
     if getattr(args, "style", None):
         CONFIG = replace(CONFIG, summary_style=args.style)
+    if getattr(args, "quality", None):
+        CONFIG = replace(CONFIG, download_quality=args.quality)
     template_path = getattr(args, "template", None)
 
     normalized_url = normalize_url(args.url_or_id)
@@ -509,6 +512,7 @@ def build_parser():
   bili2txt BV1xx411c7mD
   bili2txt BV1xx411c7mD --only transcribe
   bili2txt BV1xx411c7mD --skip summarize --whisper-model small
+  bili2txt BV1xx411c7mD --quality 720
 
   bili2txt transcribe ./audio.wav
   bili2txt transcribe ./video.mp4 --model small
@@ -530,6 +534,8 @@ def build_parser():
     p.add_argument("--force", action="store_true",
                    help="忽略缓存，强制重跑所有阶段")
     p.add_argument("--whisper-model", help="覆盖 WHISPER_MODEL 环境变量")
+    p.add_argument("--quality", choices=["audio", "360", "480", "720", "1080", "best"],
+                   help="下载清晰度（默认 audio 仅音频，最省带宽；总结场景够用）")
     p.add_argument("--style", choices=STYLES,
                    help="总结风格（覆盖 SUMMARY_STYLE）")
     p.add_argument("--template", help="自定义 jinja2 总结模板路径，覆盖内置模板")

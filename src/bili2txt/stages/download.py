@@ -101,19 +101,44 @@ def fetch_video_info(url: str, cookies: Path | None = None) -> tuple[VideoMeta, 
     return meta, data
 
 
+def build_format(quality: str) -> str:
+    """按 --quality 生成 yt-dlp -f 格式串。
+
+    - audio: 仅音频（最省带宽，做总结够用）
+    - 360/480/720/1080: 限制最高分辨率的最佳视频+音频
+    - best: 最高可下清晰度
+    """
+    if quality == "audio":
+        return "ba/bestaudio"
+    if quality == "best":
+        return "bv*+ba/b"
+    if quality.isdigit():
+        return f"bv[height<={quality}]+ba/b"
+    return "bv*+ba/b"
+
+
+# 下载产物的可能扩展名（视频 + 音频），用于从目录里挑出成品文件
+_MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".flv", ".mov", ".ts",
+               ".m4a", ".mp3", ".aac", ".opus", ".ogg", ".flac", ".wav"}
+
+
 def download_video(
     url: str,
     video_hash: str,
     cache: Cache,
     cookies: Path | None = None,
+    quality: str = "audio",
 ) -> tuple[Path, VideoMeta]:
-    """下载最佳 mp4 到 cache/<hash>/download/，返回 (视频路径, meta)。"""
+    """下载到 cache/<hash>/download/，返回 (媒体文件路径, meta)。
+
+    quality="audio" 时只下音频（默认，总结场景够用）；其余为视频+音频合并成 mp4。
+    """
     stage_dir = cache.stage_dir(video_hash, "download")
     outtmpl = str(stage_dir / "%(id)s.%(ext)s")
 
     cmd = [
         _find_ytdlp(),
-        "-f", "bv*+ba/b",         # 最佳视频+音频，回退到最佳单文件
+        "-f", build_format(quality),
         "--merge-output-format", "mp4",
         "-o", outtmpl,
         "--no-playlist",
@@ -139,11 +164,11 @@ def download_video(
         description=info.get("description", ""),
     )
 
-    video_files = [p for p in stage_dir.iterdir()
-                   if p.suffix in {".mp4", ".mkv", ".webm", ".flv"} and not p.name.endswith(".part")]
-    if not video_files:
-        raise RuntimeError(f"下载目录里没找到视频文件: {stage_dir}")
-    video_path = max(video_files, key=lambda p: p.stat().st_size)
+    media_files = [p for p in stage_dir.iterdir()
+                   if p.suffix in _MEDIA_EXTS and not p.name.endswith(".part")]
+    if not media_files:
+        raise RuntimeError(f"下载目录里没找到媒体文件: {stage_dir}")
+    video_path = max(media_files, key=lambda p: p.stat().st_size)
 
     # 算 hash（基于文件内容）
     real_hash = hash_file(video_path)

@@ -23,6 +23,7 @@ class Config:
 
     # yt-dlp
     ytdlp_cookies: Path | None
+    download_quality: str
 
     # whisper
     whisper_model: str
@@ -63,6 +64,7 @@ class Config:
             cache_dir=data_dir / "cache",
             output_dir=data_dir / "output",
             ytdlp_cookies=cookies if cookies and cookies.exists() else None,
+            download_quality=os.getenv("DOWNLOAD_QUALITY", "audio").strip() or "audio",
             whisper_model=os.getenv("WHISPER_MODEL", "base"),
             whisper_device=os.getenv("WHISPER_DEVICE", "auto"),
             whisper_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "int8"),
