@@ -6,6 +6,7 @@ import argparse
 import json
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from rich.console import Console
@@ -14,6 +15,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from . import __version__
 from .cache import Cache, delete_video, list_videos
 from .config import CONFIG
+from .prompts import STYLES
 from .stages.download import (
     VideoMeta,
     download_video,
@@ -23,7 +25,7 @@ from .stages.download import (
 )
 from .stages.extract import extract_audio
 from .stages.summarize import summarize
-from .stages.transcribe import transcribe
+from .stages.transcribe import Transcript, TranscriptSegment, transcribe
 
 console = Console()
 
@@ -92,7 +94,7 @@ def _stage_transcribe(cache, wav, vhash, force):
     return transcript
 
 
-def _stage_summarize(cache, transcript, meta, vhash):
+def _stage_summarize(cache, transcript, meta, vhash, template_path=None):
     if not CONFIG.llm_api_key:
         console.print("\n[yellow]④ 跳过 LLM 总结：未配置 LLM_API_KEY[/yellow]")
         console.print("[dim]复制 .env.example 为 .env 并填 LLM_API_KEY，再去掉 --skip summarize 即可调用。[/dim]")
@@ -107,7 +109,7 @@ def _stage_summarize(cache, transcript, meta, vhash):
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                   TimeElapsedColumn(), console=console, transient=True) as p:
         p.add_task("LLM 生成总结中...", total=None)
-        summary = summarize(transcript, meta, vhash, cache, CONFIG)
+        summary = summarize(transcript, meta, vhash, cache, CONFIG, template_path)
 
     console.print(f"\n[bold green]OK 总结完成[/bold green]")
     out_path = CONFIG.output_dir / f"{meta.video_id}_{meta.display_title}.md"
@@ -219,11 +221,75 @@ def cmd_transcribe_file(args):
         console.print(transcript.text[:300] + ("..." if len(transcript.text) > 300 else ""))
 
 
+def cmd_extract_file(args):
+    """bili2txt extract <file> — 视频/音频 → wav（跳过 yt-dlp 下载）。"""
+    src = Path(args.file).expanduser().resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"文件不存在：{src}")
+
+    cache = Cache()
+    vhash = _local_audio_hash(src)
+    wav = extract_audio(src, vhash, cache)
+
+    out = Path(args.out) if args.out else src.with_suffix(".wav")
+    if out.resolve() != wav.resolve():
+        shutil.copy(wav, out)
+    console.print(f"  ✓ 已抽出音频：{out}")
+    console.print(f"  → {out}")
+
+
+def cmd_summarize_file(args):
+    """bili2txt summarize <file> — 转写文本 → LLM 总结（跳过 ASR）。"""
+    global CONFIG
+    if getattr(args, "style", None):
+        CONFIG = replace(CONFIG, summary_style=args.style)
+
+    src = Path(args.file).expanduser().resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"文件不存在：{src}")
+
+    # 支持 .json 转写文件，也支持纯文本
+    try:
+        transcript = _load_transcript_json(src)
+    except (json.JSONDecodeError, KeyError):
+        transcript = Transcript(
+            language="zh",
+            duration=0.0,
+            text=src.read_text(encoding="utf-8"),
+            segments=[],
+        )
+
+    vhash = _local_audio_hash(src)
+    meta = VideoMeta(
+        video_id=args.title or src.stem,
+        title=args.title or src.stem,
+        duration=0,
+        uploader=args.uploader or "-",
+        webpage_url="",
+    )
+
+    console.print(f"[bold cyan]④ LLM 总结[/bold cyan]  [dim]({CONFIG.llm_model})[/dim]")
+    summary = summarize(transcript, meta, vhash, Cache(), CONFIG, getattr(args, "template", None))
+
+    out = Path(args.out) if args.out else src.with_suffix(".summary.md")
+    out.write_text(summary, encoding="utf-8")
+    console.print(f"  → {out}")
+    if summary:
+        console.print(f"\n[dim]预览：[/dim]")
+        console.print(summary[:600] + ("..." if len(summary) > 600 else ""))
+
+
 def cmd_pipeline(args):
     cache = Cache()
     only = args.only
     skip = set(args.skip or [])
     force = args.force
+
+    # --style 覆盖默认总结风格
+    global CONFIG
+    if getattr(args, "style", None):
+        CONFIG = replace(CONFIG, summary_style=args.style)
+    template_path = getattr(args, "template", None)
 
     normalized_url = normalize_url(args.url_or_id)
     try:
@@ -257,7 +323,7 @@ def cmd_pipeline(args):
         console.print("\n[yellow]④ 已跳过总结 (--skip summarize)[/yellow]")
         return
 
-    _stage_summarize(cache, transcript, meta, vhash)
+    _stage_summarize(cache, transcript, meta, vhash, template_path)
 
 
 def cmd_list(args):
@@ -464,6 +530,9 @@ def build_parser():
     p.add_argument("--force", action="store_true",
                    help="忽略缓存，强制重跑所有阶段")
     p.add_argument("--whisper-model", help="覆盖 WHISPER_MODEL 环境变量")
+    p.add_argument("--style", choices=STYLES,
+                   help="总结风格（覆盖 SUMMARY_STYLE）")
+    p.add_argument("--template", help="自定义 jinja2 总结模板路径，覆盖内置模板")
     p.add_argument("--info", dest="info_target", metavar="URL",
                    help="只看视频元信息，不下载（例: --info BV1xx...）")
     p.add_argument("--list", dest="list_cache", action="store_true",
@@ -503,6 +572,7 @@ def build_subparser(sub_name: str) -> argparse.ArgumentParser:
     elif sub_name == "summarize":
         p.add_argument("--style", choices=["default", "bullets", "academic", "casual"],
                        help="总结风格（覆盖 SUMMARY_STYLE）")
+        p.add_argument("--template", help="自定义 jinja2 总结模板路径，覆盖内置模板")
         p.add_argument("--title", help="视频标题（写到总结 markdown 头部）")
         p.add_argument("--uploader", help="UP 主（写到总结 markdown 头部）")
         p.add_argument("--out", help="输出 markdown 路径，默认 ./<file_stem>.summary.md")

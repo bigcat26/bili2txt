@@ -18,6 +18,7 @@ def summarize(
     video_hash: str,
     cache: Cache,
     cfg: Config,
+    template_path: str | Path | None = None,
 ) -> str:
     """调用 LLM 生成总结，写 markdown 到 cache + data/output。"""
     cached = cache.get_output(video_hash, "summarize")
@@ -31,12 +32,13 @@ def summarize(
         )
 
     client = OpenAI(api_key=cfg.llm_api_key, base_url=cfg.llm_base_url)
-    prompt = render_prompt(cfg.summary_style, video_meta, transcript)
+    system_prompt = render_system_prompt(template_path)
+    prompt = render_prompt(cfg.summary_style, video_meta, transcript, template_path)
 
     resp = client.chat.completions.create(
         model=cfg.llm_model,
         messages=[
-            {"role": "system", "content": "你是一个专业的内容编辑，擅长把口述 / 长视频转写内容整理成结构化笔记。"},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         temperature=0.3,
