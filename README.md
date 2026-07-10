@@ -1,10 +1,12 @@
 # bili2txt
 
+**你是我的眼, 带我阅读浩瀚的视频世界**
+
 B 站视频 → 音频 → 文字 → LLM 总结，一条命令搞定。
 
 ```
-B站链接 → 下载视频(yt-dlp) → 抽音频(wav) → Whisper(可换FunASR) → LLM总结
-   ①           ②              ③              ④              ⑤
+B站链接 → 下载视频(yt-dlp) → 抽音频(wav) → Whisper → LLM总结
+   ①           ②             ③          ④        ⑤
 ```
 
 ## 安装
@@ -40,7 +42,39 @@ uv run bili2txt info BV1xx411c7mD
 
 # 列出已处理的视频
 uv run bili2txt list
+
+# 批量跑：videos.txt 每行一个 BV / av / 完整 URL（空行 / # 注释 / 重复自动跳过）
+uv run bili2txt batch videos.txt
+# 只跑到转写，遇错即停
+uv run bili2txt batch videos.txt --only transcribe --stop-on-error
+# 走管道
+cat videos.txt | uv run bili2txt batch -
+# 并发 3（Whisper 抢 CPU 资源，默认 1 串行更稳）
+uv run bili2txt batch videos.txt -j 3
+# 不写汇总报告
+uv run bili2txt batch videos.txt --no-report
+# 报告写到指定文件
+uv run bili2txt batch videos.txt --report ./batch_log.md
 ```
+
+### 批量输入文件格式（`videos.txt`）
+
+```
+# 这是注释，会被忽略
+BV1uoME6xEGp
+BV1koT46eEJY  # 行内注释（两个空格 + #）
+av12345
+https://www.bilibili.com/video/BV1hETj6SEze
+
+BV1uoME6xEGp   # 重复会被去重，不会跑两遍
+乱七八糟的垃圾行   # 非 BV/av/URL 直接忽略
+```
+
+每行一条，支持 `BV` 号 / `av` 号 / 完整 B 站 URL。空行、`#` 开头注释、行内 `  #` 注释、重复项、非法行 都会自动跳过并在汇总里报告 `跳过 N`。
+
+### 批量结果
+
+任务结束时会输出汇总（成功/失败数 + 用时 + 失败明细），并默认把报告写到 `bili2txt_batch_report_<时间>.md`，表格里列出每条状态、用时、错误信息。失败不会阻塞后续任务；加 `--stop-on-error` 可在首个失败时中止。
 
 ## 配置
 
