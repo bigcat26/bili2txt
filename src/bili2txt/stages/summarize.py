@@ -8,7 +8,7 @@ from openai import OpenAI
 
 from ..cache import Cache
 from ..config import Config
-from ..prompts import render_prompt
+from ..prompts import render_prompt, render_system_prompt
 from .transcribe import Transcript
 
 
