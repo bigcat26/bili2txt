@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from openai import OpenAI
@@ -10,6 +11,13 @@ from ..cache import Cache
 from ..config import Config
 from ..prompts import render_prompt, render_system_prompt
 from .transcribe import Transcript
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think_block(text: str) -> str:
+    """去掉带思考模式模型（如 MiniMax-M3）输出中的 <think>...</think> 块。"""
+    return _THINK_BLOCK_RE.sub("", text).strip()
 
 
 def summarize(
@@ -43,7 +51,7 @@ def summarize(
         ],
         temperature=0.3,
     )
-    summary = (resp.choices[0].message.content or "").strip()
+    summary = _strip_think_block((resp.choices[0].message.content or "").strip())
 
     # 写两份：
     # 1. cache 里给流水线用
