@@ -26,19 +26,19 @@ cp .env.example .env   # 然后填 LLM_API_KEY
 
 ```bash
 # 全流程
-uv run bili2txt https://www.bilibili.com/video/BV1xx411c7mD
+uv run bili2txt https://www.bilibili.com/video/BV1kn1CY7EQb
 
 # 只跑到转写（不花钱）
-uv run bili2txt BV1xx411c7mD --only transcribe
+uv run bili2txt BV1kn1CY7EQb --only transcribe
 
 # 跳过 LLM 总结，但跑其他全流程
-uv run bili2txt BV1xx411c7mD --skip summarize
+uv run bili2txt BV1kn1CY7EQb --skip summarize
 
 # 强制重跑（清掉缓存）
-uv run bili2txt BV1xx411c7mD --force
+uv run bili2txt BV1kn1CY7EQb --force
 
 # 看视频元信息（不下、不转、不总结）
-uv run bili2txt info BV1xx411c7mD
+uv run bili2txt info BV1kn1CY7EQb
 
 # 列出已处理的视频
 uv run bili2txt list
